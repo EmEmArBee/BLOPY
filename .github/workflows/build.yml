@@ -1,8 +1,8 @@
-# Builds the Blop firmware (.fwsc, installable on an FM-1) on GitHub's machines, which can reach JieLi's
+# Builds the BLOPY firmware (.fwsc, installable on an FM-1) on GitHub's machines, which can reach JieLi's
 # toolchain server. Also runs the host simulator's tests.
 # Result: Actions tab > the run > "Artifacts" > osr1-firmware.
 name: Build firmware
-# A new number in the file VERSION (e.g. 1.0.0) makes the GitHub release "Blop X.Y.Z", tag vX.Y.Z, with blop-X.Y.Z.fwsc
+# A new number in the file VERSION (e.g. 1.0.0) makes the GitHub release "BLOPY X.Y.Z", tag vX.Y.Z, with blopy-X.Y.Z.fwsc
 # (a release build, identity FM-1_94 + XXYYZZ): what the FM-1 Firmware Hub picks up. A tag vX.Y.Z pushed does too.
 on:
   push:
@@ -31,7 +31,7 @@ jobs:
       - name: Host simulator tests
         run: |
           python3 fm1-base/tools/build.py . --host
-          build/host/blop_host tests/basic.txt build/host
+          build/host/blopy_host tests/basic.txt build/host
 
       - name: JieLi toolchain
         run: fm1-base/tools/get_toolchain.sh "$HOME/.jieli"
@@ -74,9 +74,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           F=$(ls build/*.fwsc | head -1)
-          cp "$F" Blop.fwsc
+          cp "$F" Blopy.fwsc
           gh release delete latest --yes --cleanup-tag || true     # (the old dev pre-release: releases are tagged now)
-          mkdir out && cp Blop.fwsc out/ && cd out
+          mkdir out && cp Blopy.fwsc out/ && cd out
           echo "$GITHUB_SHA" > COMMIT
           git init -q -b builds && git add . 
           git -c user.name=github-actions -c user.email=actions@github.com commit -q -m "build ${GITHUB_SHA::7}"
@@ -95,24 +95,24 @@ jobs:
           python3 fm1-base/tools/build.py . --release "$V"
           pip install -q ziglang
           tools/build_web.sh
-          python3 fm1-base/tools/make_site.py . "build/blop-$V.fwsc" "$V" build/site
+          python3 fm1-base/tools/make_site.py . "build/blopy-$V.fwsc" "$V" build/site
           cd build/site
           git init -q -b gh-pages && git add -A
-          git -c user.name=github-actions -c user.email=actions@github.com commit -q -m "Site for Blop $V (${GITHUB_SHA::7})"
+          git -c user.name=github-actions -c user.email=actions@github.com commit -q -m "Site for BLOPY $V (${GITHUB_SHA::7})"
           git push -f -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
           gh api -X POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null 2>&1 || echo "(Pages not on yet)"
-          echo "::notice title=site::Blop $V on gh-pages"
+          echo "::notice title=site::BLOPY $V on gh-pages"
           cd ../..
           if [ "$REL" = 1 ]; then
-            gh release create "v$V" "build/blop-$V.fwsc" --title "Blop $V" --target "$GITHUB_SHA" \
-              --notes "Blop by Obsimo $V: one-finger chords, chord rhythms, a bass with its own riffs, discreet drums with sidechain, and a little creature swimming to your chords. Install it from https://osr-experiment.github.io/OSR-1/install/ (Chrome or Edge, the FM-1 connected by USB)."
-            echo "::notice title=release::Blop $V released"
+            gh release create "v$V" "build/blopy-$V.fwsc" --title "BLOPY $V" --target "$GITHUB_SHA" \
+              --notes "BLOPY by DRAG0N $V (a fork of BLOP by Obsimo): one-finger chords, chord rhythms, a bass with its own riffs, discreet drums with sidechain, and a little creature swimming to your chords. Install it from https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/install/ (Chrome or Edge, the FM-1 connected by USB)."
+            echo "::notice title=release::BLOPY $V released"
           fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: blop-firmware
+          name: blopy-firmware
           path: |
             build/*.fwsc
             build/*.bin

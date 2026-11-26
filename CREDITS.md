@@ -1,6 +1,7 @@
 # Crédits
 
-OSR-1 par Obsimo (OSR Records), sous GPL-3.0-only.
+BLOPY par DRAG0N, fork de OSR-1 / BLOP par Obsimo (OSR Records), sous GPL-3.0-only.
+Le code d'origine reste © Obsimo (OSR Records) ; les modifications de ce fork sont © DRAG0N.
 
 ## Construit sur
 

@@ -361,7 +361,7 @@ static void send_bass(void) { eng_bass(set.bsound, set.bmotif, (float)set.blevel
 
 /* ------------------------------------------------------------------ playing --- */
 static int cur_idx = -1, held_idx = -1, active;
-static char chord_txt[16] = "BLOP";
+static char chord_txt[16] = "BLOPY";
 /* the voices' pitches for the screen, as the engine glides them */
 static struct { float from, to; uint32_t t0, dur; } vis[5];
 
@@ -485,7 +485,10 @@ static struct {
     uint32_t reset_at;                   /* HOME + REC held since (0: not) */
     uint8_t reset_shown, reset_done;
     uint8_t bowl, dark, clean;           /* fun: the bowl view, the light off, no info on the screen */
+    uint32_t sel_at;                     /* SEL pressed since (shift key) */
+    uint8_t sel_used;                    /* another button was pressed while SEL was held */
 } ui;
+static uint32_t btn_now;                 /* the buttons as read this frame (SEL as shift is looked up here) */
 static void fun(int k);                  /* the bottom row (screen part) */
 
 static void int_text(int32_t v, char *b)
@@ -613,7 +616,9 @@ static void encoder(int k, int32_t e)
 static void button(int k)
 {
     char t[8];
-    int p;
+    int p, shift = (int)((btn_now >> B_SEL) & 1u) && k != B_SEL;
+    if (shift) ui.sel_used = 1;
+    if (k == B_SEL) { ui.sel_at = plat_ms(); ui.sel_used = 0; return; }   /* acts on release (tap = CHORDS page) */
     for (p = 1; p < NPAGE; p++)
         if (PAGE_BTN[p] == k) {          /* a page; the same button again: back to the main page */
             set.page = (uint8_t)(set.page == p ? PG_MAIN : p);
@@ -623,14 +628,23 @@ static void button(int k)
     switch (k) {
     case B_HOME: ui.home_at = plat_ms(); ui.home_long = 0; return;    /* acts on release (held = help) */
     case B_SAVE:
-        ui.bowl ^= 1u;
+        if (!shift) { app_say("SAVE", "COMING SOON"); return; }
+        ui.bowl ^= 1u;                   /* SEL + SAVE: the bowl */
         eng_muffle(ui.bowl ? 1.0f : 0.0f);
         return;
     case B_REC:
         if ((ui.btn >> B_HOME) & 1u) return;      /* HOME + REC: the reset (input), not food */
-        fun(k);
+        if (!shift) { app_say("REC", "COMING SOON"); return; }
+        fun(k);                          /* SEL + REC: food */
         return;
-    case B_ARP: case B_SEQ: case B_PLAY: fun(k); return;
+    case B_ARP: case B_SEQ:
+        if (!shift) { app_say(k == B_ARP ? "ARP" : "SEQ", "COMING SOON"); return; }
+        fun(k);                          /* SEL + ARP: the light, SEL + SEQ: a pirouette */
+        return;
+    case B_PLAY:
+        if (!shift) { app_say("PLAY", "NO SEQ / ARP YET"); return; }
+        fun(k);                          /* SEL + PLAY: just the picture */
+        return;
     case B_OCTDN:
     case B_OCTUP:
         set.octave = (int8_t)clamp(set.octave + (k == B_OCTUP ? 1 : -1), -2, 2);
@@ -648,6 +662,7 @@ static void input(void)
     uint32_t keys = plat_keys(), btn = plat_buttons(), k, lit_keys = 0, lit_btn = 0, now = plat_ms();
     int32_t e;
     clock_follow(now);
+    btn_now = btn;
     for (k = 0; k < NKEYS; k++) {
         uint32_t bit = 1u << k;
         if ((keys & bit) && !(ui.keys & bit)) {
@@ -662,6 +677,11 @@ static void input(void)
     for (k = 0; k < NB; k++) {
         uint32_t bit = 1u << k;
         if ((btn & bit) && !(ui.btn & bit)) button((int)k);
+    }
+    /* SEL released without any other button: a tap, the CHORDS page (the old SCL button) */
+    if (!((btn >> B_SEL) & 1u) && ((ui.btn >> B_SEL) & 1u) && !ui.sel_used && now - ui.sel_at < 600u) {
+        set.page = (uint8_t)(set.page == PG_ACC ? PG_MAIN : PG_ACC);
+        dirty();
     }
     /* HOME + REC held 3 s: back to the settings of the first start (a countdown; let go before: nothing) */
     if (((btn >> B_HOME) & 1u) && ((btn >> B_REC) & 1u)) {
@@ -1207,22 +1227,24 @@ static void room(float sx, float sy, float s, float *c)
 }
 
 /* the title, BLOP: a 5 x 7 font, each dot 3 x 3 big pixels, the letters bobbing */
-static const uint8_t TITLE_FONT[4][7] = {
+static const uint8_t TITLE_FONT[5][7] = {
     {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},   /* B */
     {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},   /* L */
     {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},   /* O */
     {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},   /* P */
+    {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},   /* Y */
 };
-#define TITLE_X 7
+#define TITLE_X 2
+#define TITLE_P 15                       /* letter pitch (big pixels): 5 letters in 80 */
 #define TITLE_Y 11
 static int title_dot(int cx, int cy)       /* the title's dot under a big pixel (0 / 1) */
 {
-    int lx = cx - TITLE_X, letter = lx / 17, col, row, oy;
-    if (lx < 0 || letter > 3 || lx % 17 >= 15) return 0;
+    int lx = cx - TITLE_X, letter = lx / TITLE_P, col, row, oy;
+    if (lx < 0 || letter > 4 || lx % TITLE_P >= 13) return 0;
     oy = (int)(1.5f * sinr(sc.t * 4.0f + (float)letter * 1.2f) + 1.5f);
     row = (cy - TITLE_Y - oy) / 3;
     if (cy - TITLE_Y - oy < 0 || row > 6) return 0;
-    col = (lx % 17) / 3;
+    col = (lx % TITLE_P) * 5 / 13;
     return (TITLE_FONT[letter][row] >> (4 - col)) & 1;
 }
 /* the lines under it, in the same lights (one big pixel a dot): BY OBSIMO a second after BLOP, and while HOME
@@ -1236,9 +1258,13 @@ static const struct { char ch; uint8_t rows[7]; } GLYPH[] = {
     {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}}, {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
     {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}}, {';', {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x04, 0x08}},
     {')', {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}},
+    {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}}, {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}}, {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}}, {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
 };
 static const struct { const char *s; int x, y; float t0; uint8_t home_only; } LINE[3] = {
-    {"BY OBSIMO", 13, 41, 1000.0f, 0}, {"GO STREAM", 13, 52, 1900.0f, 1}, {"MY MUSIC ;)", 7, 61, 2460.0f, 1},
+    {"BY DRAG0N", 10, 41, 1000.0f, 0}, {"FORK OF BLOP", 4, 52, 1900.0f, 1}, {"BY OBSIMO", 13, 61, 2460.0f, 1},
 };
 static const uint8_t *glyph_rows(char ch)
 {
@@ -1269,7 +1295,7 @@ static void title_light(int cx, int cy, float *c)
 {
     float k = sc.title, g = 0.0f;
     int dx, dy, l;
-    if (cx >= TITLE_X - 2 && cx <= TITLE_X + 68 && cy >= TITLE_Y - 2 && cy <= TITLE_Y + 26) {   /* BLOP */
+    if (cx >= TITLE_X - 2 && cx <= TITLE_X + 76 && cy >= TITLE_Y - 2 && cy <= TITLE_Y + 26) {   /* BLOPY */
         if (title_dot(cx, cy)) g = 1.0f;
         else
             for (dy = -1; dy <= 1; dy++)
@@ -1278,7 +1304,7 @@ static void title_light(int cx, int cy, float *c)
     }
     for (l = 0; l < 3 && g < 1.0f; l++) {                                                      /* the lines */
         if (LINE[l].home_only && !ui.help) continue;
-        if (cy < LINE[l].y - 16 || cy > LINE[l].y + 8 || cx < LINE[l].x - 1 || cx > LINE[l].x + 66) continue;
+        if (cy < LINE[l].y - 16 || cy > LINE[l].y + 8 || cx < LINE[l].x - 1 || cx > LINE[l].x + 72) continue;
         if (line_dot(l, cx, cy)) g = 1.0f;
         else
             for (dy = -1; dy <= 1; dy++)
@@ -1572,14 +1598,14 @@ static uint16_t page_col(void) { const uint8_t *c = PAGE_RGB[set.page]; return R
 
 static void draw_top_text(void)
 {
-    const char *chord = active ? chord_txt : (chord_txt[0] ? chord_txt : "BLOP");
+    const char *chord = active ? chord_txt : (chord_txt[0] ? chord_txt : "BLOPY");
     uint32_t now = plat_ms();
     if (now < ui.msg_until) {
         int32_t x = cv_text(8, 0, &FONT_XS, ui.msg[0], RGB(200, 196, 210));
         cv_text(x + 6, 0, &FONT_XS, ui.msg[1], page_col());
     } else if (sc.sleep_at && now - sc.sleep_at > 15000u) {
         /* the credit, while it sleeps */
-        static const char *const CREDIT[3] = {"BLOP BY OBSIMO", "GO STREAM MY MUSIC ;)", "ZZZ..."};
+        static const char *const CREDIT[3] = {"BLOPY BY DRAG0N", "FORK OF BLOP BY OBSIMO", "ZZZ..."};
         int k = (int)((now / 3000u) % 3u);
         cv_text(8, 0, &FONT_XS, CREDIT[k], k == 2 ? RGB(170, 166, 180) : RGB(255, 214, 110));
     } else {

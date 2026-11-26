@@ -1,3 +1,14 @@
+# BLOPY (by DRAG0N)
+
+Fork of **Blop by Obsimo** (OSR-Experiment/OSR-1, GPL-3.0-only) for the M-VAVE FM-1. Same sound engine, same aquarium, plus:
+
+- **SEL is a shift key.** A short tap on SEL is still the CHORDS page. SEL + SAVE / ARP / SEQ / PLAY / REC give the old fun functions (bowl, light, pirouette, picture only, food).
+- Work in progress: REC + key = chord editor, SEQ = chord sequencer, ARP = arpeggiator, PLAY/STOP = transport.
+
+The original README (French) follows.
+
+---
+
 # Blop (by Obsimo)
 
 Firmware pour le synthé M-VAVE FM-1 : grilles d'accords jouables à un doigt, rythmes d'accords, kick et

@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Obsimo (OSR Records) */
-/* BLOP by Obsimo: one-finger chord grids, chord rhythms, kick and sidechain, for the M-VAVE FM-1 (on fm1-base).
+/* BLOPY by DRAG0N (a fork of BLOP by Obsimo): one-finger chord grids, chord rhythms, kick and sidechain, for the M-VAVE FM-1 (on fm1-base).
  * This header is the app's half of the contract with the platform (device/unity.c, host/plat_host.c). */
 #pragma once
 #include <stdint.h>
 #include "plat.h"
 
-#define APP_NAME "BLOP"
+#define APP_NAME "BLOPY"
 #define APP_SPLASH_RGB RGB(255, 214, 110)
 #define APP_SPLASH                      /* app_splash: the intro's first picture, not the platform's white page */
 #define APP_TICK                        /* app_tick: the MIDI in, each clock timed to the ms */

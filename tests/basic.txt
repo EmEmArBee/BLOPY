@@ -169,32 +169,72 @@ tap HOME
 wait 30
 expect page 0
 # the bottom row: bowl, food, light, clean screen, pirouette
+press SEL
+wait 30
 tap SAVE
+wait 30
+release SEL
+wait 30
 wait 900
 expect bowl 1
 shot bowl.png
+press SEL
+wait 30
 tap SAVE
+wait 30
+release SEL
+wait 30
 wait 600
 expect bowl 0
+press SEL
+wait 30
 tap REC
+wait 30
+release SEL
+wait 30
 wait 700
 shot food.png
 wait 2500
 shot food2.png
+press SEL
+wait 30
 tap ARP
+wait 30
+release SEL
+wait 30
 wait 500
 expect dark 1
 shot dark.png
+press SEL
+wait 30
 tap ARP
 wait 30
+release SEL
+wait 30
+wait 30
+press SEL
+wait 30
 tap PLAY
+wait 30
+release SEL
+wait 30
 wait 600
 expect clean 1
 shot clean.png
+press SEL
+wait 30
 tap PLAY
 wait 30
+release SEL
+wait 30
+wait 30
 expect clean 0
+press SEL
+wait 30
 tap SEQ
+wait 30
+release SEL
+wait 30
 wait 300
 shot pirouette.png
 # HOME held: the help screen
@@ -272,3 +312,37 @@ expect syncbpm 125
 clock 200 20
 wait 600
 expect syncbpm 0
+# BLOPY: SEL is a shift key. Alone (a tap) it is still the CHORDS page; with SAVE / ARP / SEQ / PLAY / REC the old fun ones.
+# Without SEL those buttons no longer do the old things.
+expect page 0
+tap SAVE
+wait 300
+expect bowl 0
+tap ARP
+wait 300
+expect dark 0
+tap PLAY
+wait 300
+expect clean 0
+tap SEL
+wait 650
+expect page 2
+tap SEL
+wait 650
+expect page 0
+# SEL held with another button: no page change when SEL is let go
+press SEL
+wait 30
+tap SAVE
+wait 30
+release SEL
+wait 650
+expect page 0
+expect bowl 1
+press SEL
+wait 30
+tap SAVE
+wait 30
+release SEL
+wait 650
+expect bowl 0

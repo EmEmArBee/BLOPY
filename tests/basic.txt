@@ -488,3 +488,22 @@ turn SELECT 5
 wait 20
 expect grid 0
 
+# a custom chord with only the root and the fifth is named like a guitar power chord: E POWER
+press REC
+wait 30
+key 7 down
+wait 50
+key 7 up
+release REC
+wait 100
+turn K3 -1
+wait 20
+expect chordpower 1
+shot power.png
+turn K3 1
+wait 20
+expect chordpower 0
+tap HOME
+wait 700
+expect edopen 0
+

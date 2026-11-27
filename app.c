@@ -303,9 +303,11 @@ static void chord_name(const chord_t *c, char *b)
     int sus4 = !m && !M && has(c, 5), sus2 = !m && !M && !has(c, 5) && has(c, 2);
     int dim = m && has(c, 6) && !has(c, 7), aug = M && has(c, 8) && !has(c, 7);
     int maj7 = has(c, 11), min7 = has(c, 10), six = has(c, 9), add9 = has(c, 2) && !sus2;
-    int eleven = has(c, 5) && (m || M);
+    int eleven = has(c, 5) && (m || M), i, power = has(c, 7);
+    for (i = 0; i < c->n; i++) if (c->iv[i] % 12 != 0 && c->iv[i] % 12 != 7) power = 0;
     b[0] = 0;
     text_cat(b, NOTE[c->root]);
+    if (power) { text_cat(b, " POWER"); return; }        /* root + fifth only: a guitar power chord */
     if (dim) { text_cat(b, min7 ? "m7b5" : "dim"); return; }
     if (m) text_cat(b, "m");
     if (aug) text_cat(b, "+");
@@ -2034,6 +2036,7 @@ int app_expect(const char *what, int *got)
     else if (!strcmp(what, "c0root19")) *got = crec_unpack(set.cust[0].rec[KEY_C4 + 12]).root;
     else if (!strcmp(what, "c0qual19")) *got = crec_unpack(set.cust[0].rec[KEY_C4 + 12]).qual;
     else if (!strcmp(what, "c1used")) *got = set.cust[1].used;
+    else if (!strcmp(what, "chordpower")) { const char *q = chord_txt; *got = 0; while (*q) { if (!strncmp(q, "POWER", 5)) *got = 1; q++; } }
     else if (!strcmp(what, "edname0")) *got = (unsigned char)ed.p.name[0];
     else if (!strcmp(what, "c1name0")) *got = (unsigned char)set.cust[1].name[0];
     else if (!strcmp(what, "note0")) *got = (int)vis[0].to;

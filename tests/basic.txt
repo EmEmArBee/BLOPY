@@ -346,3 +346,145 @@ wait 30
 release SEL
 wait 650
 expect bowl 0
+
+# ===== BLOPY chord editor: REC + key =====
+tap HOME
+wait 700
+expect page 0
+expect edopen 0
+# REC alone, outside the editor, only says what to do
+tap REC
+wait 100
+expect edopen 0
+expect page 0
+# REC + key: the editor opens for that key, on the first custom preset
+press REC
+wait 30
+key 7 down
+wait 80
+expect edopen 1
+expect page 7
+expect edkey 7
+expect cslot 0
+expect grid 38
+expect edshared 1
+key 7 up
+wait 30
+release REC
+wait 100
+expect page 7
+# page A: ROOT and QUALITY
+turn K1 -20
+wait 20
+expect edroot 0
+turn K1 4
+wait 20
+expect edroot 4
+turn K2 -10
+turn K2 1
+wait 20
+key 7 down
+wait 150
+shot ed_page_a.png
+key 7 up
+wait 30
+expect eddirty 1
+# SAVE stores it, and as the preset is 'all octaves' the C5 key follows
+expect c0used 0
+tap SAVE
+wait 200
+expect eddirty 0
+expect c0used 1
+expect c0root 4
+expect c0qual 1
+expect c0root19 4
+expect c0qual19 1
+# pages: REC (alone) goes to the next
+tap REC
+wait 100
+expect edsub 1
+expect page 8
+shot ed_page_b.png
+tap REC
+wait 100
+expect edsub 2
+expect page 9
+shot ed_page_c.png
+tap REC
+wait 100
+expect edsub 0
+expect page 7
+# an inversion: the third in the bass
+tap REC
+wait 100
+turn K2 1
+wait 20
+key 7 down
+wait 200
+expect bass 43
+key 7 up
+wait 30
+turn K2 -1
+# 'this key only': another octave is left alone
+turn K3 -1
+wait 20
+expect edshared 0
+tap REC
+wait 50
+tap REC
+wait 50
+expect page 7
+turn K1 1
+wait 20
+tap SAVE
+wait 200
+expect c0root 5
+expect c0root19 4
+# the name: DUSTOM 1
+tap REC
+wait 50
+tap REC
+wait 50
+expect page 9
+turn K2 1
+wait 20
+expect edname0 68
+# not saved yet: HOME drops it
+tap HOME
+wait 700
+expect edopen 0
+expect page 0
+expect grid 38
+# the encoder does not change the preset while editing
+press REC
+key 9 down
+wait 50
+key 9 up
+release REC
+wait 50
+expect edopen 1
+turn SELECT 1
+wait 20
+expect grid 38
+# another preset from the PRESET knob (page B, K4)
+tap REC
+wait 50
+turn K4 1
+wait 20
+expect edslot 1
+expect cslot 1
+expect grid 39
+tap SAVE
+wait 200
+expect c1used 1
+tap HOME
+wait 700
+expect edopen 0
+# the encoder walks the 38 grids and then the 8 custom presets, and wraps
+turn SELECT 2
+wait 20
+expect grid 41
+turn SELECT 5
+wait 20
+expect grid 0
+

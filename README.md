@@ -3,7 +3,12 @@
 Fork of **Blop by Obsimo** (OSR-Experiment/OSR-1, GPL-3.0-only) for the M-VAVE FM-1. Same sound engine, same aquarium, plus:
 
 - **SEL is a shift key.** A short tap on SEL is still the CHORDS page. SEL + SAVE / ARP / SEQ / PLAY / REC give the old fun functions (bowl, light, pirouette, picture only, food).
-- Work in progress: REC + key = chord editor, SEQ = chord sequencer, ARP = arpeggiator, PLAY/STOP = transport.
+- **Chord editor.** Hold REC and press a key: the editor opens for that key (HOME leaves it, REC alone goes to the next of its 3 pages, SAVE stores).
+  Page A: ROOT, QUALITY (maj, min, sus2, sus4, dim, aug), 3RD on/off, 5TH on/off. Page B: EXTRA (7, maj7, 6, add9, 9, maj9, 6/9),
+  INVERSION, OCTAVES (this key only / all octaves), PRESET (1-8). Page C: the preset name, letter by letter.
+  Custom presets 1-8 are after the 38 grids on the SELECT encoder. A fresh preset starts as the grid that was playing.
+  Changes not saved are dropped when you leave.
+- Work in progress: SEQ = chord sequencer, ARP = arpeggiator, PLAY/STOP = transport.
 
 The original README (French) follows.
 

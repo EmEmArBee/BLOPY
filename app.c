@@ -29,7 +29,11 @@
 #include "patterns.h"
 
 /* ------------------------------------------------------------------ settings --- */
-#define SET_MAGIC 0x4F535236u            /* "OSR6" (v6: bass 80 %, 2-STEP first) */
+#define SET_MAGIC 0x42505931u            /* "BPY1" (BLOPY: custom chord presets) */
+#define NCUST 8                          /* custom chord presets (after the grids) */
+/* a custom chord preset: 8 characters (space padded), edited once or not, chords apply to all octaves or per key,
+ * and one packed chord per key (see crec_pack) */
+typedef struct { char name[8]; uint8_t used, shared; uint16_t rec[NKEYS]; } cust_t;
 typedef struct {
     uint32_t magic;
     uint8_t grid, key, rich, voicing;
@@ -42,11 +46,20 @@ typedef struct {
     uint8_t dpat, dkick, dhat, drim;            /* drums */
     uint8_t bsound, blevel, bmotif, bcut;       /* bass */
     uint8_t creature, eyes, decor, acc;         /* decor */
-    uint8_t rsv[3];
+    uint8_t cslot, rsv[2];                      /* the custom preset REC + key edits from a built-in grid */
+    cust_t cust[NCUST];
 } settings_t;
 static settings_t set;
 static uint8_t set_dirty;
 static uint32_t dirty_at;             /* when the settings last changed (auto-save)*/
+
+/* the chord editor (REC + key): a working copy of the preset, so nothing is lost by moving between keys; SAVE stores it */
+static struct {
+    uint8_t open, sub, key, dirty, slot, pos, ch, pad;
+    uint8_t root, qual, third, fifth, ext, inv;       /* the edited chord, as the knobs show it */
+    cust_t p;
+} ed;
+static void cust_defaults(void);
 
 static void settings_defaults(void)
 {
@@ -59,6 +72,7 @@ static void settings_defaults(void)
     set.dpat = 0; set.dkick = 75;   /* the drums start as a plain kick */ set.dhat = 30; set.drim = 25;
     set.bsound = BASS_ROND; set.blevel = 80; set.bmotif = MOTIF_SUIT; set.bcut = 45;
     set.creature = 0; set.eyes = 0; set.decor = 0; set.acc = 0;
+    cust_defaults();
 }
 
 static float glide_s(void) { return set.glide < 1u ? 0.0f : (float)set.glide * 0.015f; }
@@ -116,26 +130,157 @@ static int quality_ivs(char q, int rich, int8_t *iv)
     return n;
 }
 
-typedef struct { int root; int8_t iv[6]; int n; int bass_off; int oct; int shift; } chord_t;
+typedef struct { int root; int8_t iv[6]; int n; int bass_off; int oct; int shift; int inv_pc; } chord_t;
+
+/* ---- custom chords: a chord of one key in 14 bits: root 4 | quality 3 | third on 1 | fifth on 1 | extra 3 | inversion 2 */
+typedef struct { uint8_t root, qual, third, fifth, ext, inv; } crec_t;
+static const char *const QUAL_NAME[6] = {"MAJ", "MIN", "SUS2", "SUS4", "DIM", "AUG"};
+static const char *const EXT_NAME[8] = {"NONE", "7", "MAJ7", "6", "ADD9", "9", "MAJ9", "6/9"};
+static const char *const INV_NAME[4] = {"ROOT", "1ST", "2ND", "3RD"};
+static const char *const SCOPE_NAME[2] = {"THIS KEY", "ALL OCT"};
+static const char *const SLOT_NAME[NCUST] = {"1", "2", "3", "4", "5", "6", "7", "8"};
+static const char CHARSET[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
+#define NCHARS 38
+static const char *const CHAR_NAME[NCHARS] = {"SPC", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
+    "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-"};
+
+static uint16_t crec_pack(const crec_t *r)
+{
+    return (uint16_t)(r->root | r->qual << 4 | r->third << 7 | r->fifth << 8 | r->ext << 9 | r->inv << 12);
+}
+static crec_t crec_unpack(uint16_t v)
+{
+    crec_t r;
+    r.root = v & 15u; r.qual = (v >> 4) & 7u; r.third = (v >> 7) & 1u; r.fifth = (v >> 8) & 1u;
+    r.ext = (v >> 9) & 7u; r.inv = (v >> 12) & 3u;
+    if (r.root > 11) r.root = 0;
+    if (r.qual > 5) r.qual = 0;
+    return r;
+}
+/* the intervals of a custom chord (root first, no repeated note); returns the count */
+static int crec_ivs(const crec_t *r, int8_t *iv)
+{
+    static const int8_t T[6] = {4, 3, 2, 5, 3, 4}, F[6] = {7, 7, 7, 7, 6, 8};
+    static const int8_t E[8][2] = {{0, 0}, {10, 0}, {11, 0}, {9, 0}, {14, 0}, {10, 14}, {11, 14}, {9, 14}};
+    int n = 0, i, q = r->qual > 5 ? 0 : r->qual, e = r->ext & 7;
+    iv[n++] = 0;
+    if (r->third) iv[n++] = T[q];
+    if (r->fifth) iv[n++] = F[q];
+    for (i = 0; i < 2; i++) {
+        int v = E[e][i], k, dup = 0;
+        if (!v) continue;
+        for (k = 0; k < n; k++) if (iv[k] % 12 == v % 12) dup = 1;
+        if (!dup) iv[n++] = (int8_t)v;
+    }
+    return n;
+}
+/* the closest custom chord to a built-in one (to start editing from the grid that was playing) */
+static crec_t crec_from_iv(int root, const int8_t *iv, int n)
+{
+    crec_t r;
+    int p[12] = {0}, i, nine, m7, M7, six;
+    for (i = 0; i < n; i++) p[((iv[i] % 12) + 12) % 12] = 1;
+    memset(&r, 0, sizeof r);
+    r.root = (uint8_t)(root % 12); r.third = 1; r.fifth = 1;
+    if (p[3] && p[6] && !p[7]) r.qual = 4;
+    else if (p[4] && p[8] && !p[7]) r.qual = 5;
+    else if (p[4]) r.qual = 0;
+    else if (p[3]) r.qual = 1;
+    else if (p[5]) r.qual = 3;
+    else if (p[2]) r.qual = 2;
+    else { r.qual = 0; r.third = 0; }
+    r.fifth = (uint8_t)(r.qual == 4 ? p[6] : r.qual == 5 ? p[8] : p[7]);
+    nine = p[2] && r.qual != 2; m7 = p[10]; M7 = p[11]; six = p[9];
+    r.ext = (uint8_t)((M7 && nine) ? 6 : M7 ? 2 : (m7 && nine) ? 5 : m7 ? 1 : (six && nine) ? 7 : six ? 3 : nine ? 4 : 0);
+    return r;
+}
 
 #define KEY_C4 7                         /* key index of C4 (key 0 is F3) */
-static chord_t build_chord(int key)
+static chord_t grid_chord(int g, int key, int tonic, int rich)
 {
     chord_t c;
     const chord_def_t *d;
     int rel = key - KEY_C4, pos = ((rel % 12) + 12) % 12, oct = rel < 0 ? -1 : rel / 12, i;
-    d = &grid_w[set.grid][0];
-    if (pos == 0 && oct >= 1) d = &grid_w[set.grid][7];            /* C5: the grid's 8th chord */
+    d = &grid_w[g][0];
+    if (pos == 0 && oct >= 1) d = &grid_w[g][7];            /* C5: the grid's 8th chord */
     else {
-        for (i = 0; i < 7; i++) if (WHITE_IDX[i] == pos) d = &grid_w[set.grid][i];
-        for (i = 0; i < 5; i++) if (BLACK_IDX[i] == pos) d = &grid_b[set.grid][i];
+        for (i = 0; i < 7; i++) if (WHITE_IDX[i] == pos) d = &grid_w[g][i];
+        for (i = 0; i < 5; i++) if (BLACK_IDX[i] == pos) d = &grid_b[g][i];
     }
-    c.root = (set.key + d->semi) % 12;
-    c.n = quality_ivs(d->q, set.rich, c.iv);
+    c.root = (tonic + d->semi) % 12;
+    c.n = quality_ivs(d->q, rich, c.iv);
     c.bass_off = 0;
     c.oct = oct;
     c.shift = set.octave * 12;
+    c.inv_pc = -1;
     return c;
+}
+
+static void cust_fill(cust_t *p, int g, int tonic, int rich)     /* a preset from a built-in grid */
+{
+    int k;
+    for (k = 0; k < NKEYS; k++) {
+        chord_t c = grid_chord(g, k, tonic, rich);
+        crec_t r = crec_from_iv(c.root, c.iv, c.n);
+        p->rec[k] = crec_pack(&r);
+    }
+}
+static void cust_defaults(void)
+{
+    int s;
+    set.cslot = 0;
+    for (s = 0; s < NCUST; s++) {
+        memcpy(set.cust[s].name, "CUSTOM 1", 8);
+        set.cust[s].name[7] = (char)('1' + s);
+        set.cust[s].used = 0; set.cust[s].shared = 1;
+        cust_fill(&set.cust[s], 0, 0, GRID_DEF[0].rich);
+    }
+}
+static void cust_name(const cust_t *p, char *o)           /* the name without its trailing spaces (o: 9 bytes) */
+{
+    int i, n = 8;
+    for (i = 0; i < 8; i++) o[i] = p->name[i];
+    while (n > 0 && o[n - 1] == ' ') n--;
+    if (!n) o[n++] = '-';
+    o[n] = 0;
+}
+static void cust_sanitize(void)
+{
+    int s, i, k;
+    for (s = 0; s < NCUST; s++) {
+        for (i = 0; i < 8; i++) {
+            int ok = 0;
+            for (k = 0; k < NCHARS; k++) if (CHARSET[k] == set.cust[s].name[i]) ok = 1;
+            if (!ok) set.cust[s].name[i] = ' ';
+        }
+        if (set.cust[s].shared > 1) set.cust[s].shared = 1;
+    }
+    if (set.cslot >= NCUST) set.cslot = 0;
+}
+/* the custom preset the keys play now (while editing: the working copy), or 0 on a built-in grid */
+static const cust_t *cur_cust(void)
+{
+    if (set.grid < NGRID) return 0;
+    return ed.open ? &ed.p : &set.cust[set.grid - NGRID];
+}
+
+static chord_t build_chord(int key)
+{
+    const cust_t *cp = cur_cust();
+    if (cp) {
+        chord_t c;
+        crec_t r = crec_unpack(cp->rec[key < 0 ? 0 : key >= NKEYS ? NKEYS - 1 : key]);
+        int rel = key - KEY_C4;
+        c.n = crec_ivs(&r, c.iv);
+        c.root = r.root;
+        c.bass_off = 0;
+        c.inv_pc = -1;
+        if (r.inv > 0 && r.inv < c.n) { c.bass_off = c.iv[r.inv]; c.inv_pc = (c.root + c.iv[r.inv]) % 12; }
+        c.oct = rel < 0 ? -1 : rel / 12;
+        c.shift = set.octave * 12;
+        return c;
+    }
+    return grid_chord(set.grid, key, set.key, set.rich);
 }
 
 static int has(const chord_t *c, int pc)
@@ -177,7 +322,7 @@ static void chord_name(const chord_t *c, char *b)
 /* the 4-note voicing closest to the centre: the same key always sounds the same */
 static void voice_chord(const chord_t *c, float *out)
 {
-    int pcs[6], np = 0, i, r, base, best_set = 0;
+    int pcs[6], np = 0, i, r, base, best_set = 0, rlo, rhi;
     int center = 64 + c->oct * 7 + c->shift;
     float best = 1e9f;
     for (i = 0; i < c->n; i++) {
@@ -196,7 +341,10 @@ static void voice_chord(const chord_t *c, float *out)
         np = j;
     }
     if (np > 4) np = 4;
-    for (r = 0; r < np; r++) {
+    rlo = 0; rhi = np - 1;
+    if (c->inv_pc >= 0)                  /* an inversion: that note lowest (if the voicing kept it) */
+        for (i = 0; i < np; i++) if (pcs[i] == c->inv_pc) { rlo = rhi = i; break; }
+    for (r = rlo; r <= rhi; r++) {
         for (base = 50 + c->shift; base <= 72 + c->shift; base++) {
             int notes[4], k, cur = base, cnt = 0;
             float mean = 0.0f, cost;
@@ -205,7 +353,7 @@ static void voice_chord(const chord_t *c, float *out)
                 while (((cur % 12) + 12) % 12 != p) cur++;
                 notes[cnt++] = cur++;
             }
-            if (cnt == 3) notes[cnt++] = notes[0] + 12;
+            while (cnt < 4) { notes[cnt] = notes[cnt - np] + 12; cnt++; }     /* 1..3 notes: doubled an octave up */
             if (notes[0] < 50 + c->shift || notes[cnt - 1] > 84 + c->shift) continue;
             for (k = 0; k < 4; k++) mean += (float)notes[k];
             mean *= 0.25f;
@@ -402,15 +550,104 @@ static void stop(void)
 
 static void rechord(void) { if (active && cur_idx >= 0) play(cur_idx); }
 
+/* ------------------------------------------------------------------ chord editor (REC + key) --- */
+static void dirty(void);
+enum { PG_MAIN, PG_FX, PG_ACC, PG_GROOVE, PG_BASS, PG_DECOR, PG_DRUMS, PG_ED1, PG_ED2, PG_ED3, NPAGE };
+
+static void ed_load_fields(void)
+{
+    crec_t r = crec_unpack(ed.p.rec[ed.key]);
+    ed.root = r.root; ed.qual = r.qual; ed.third = r.third; ed.fifth = r.fifth; ed.ext = r.ext; ed.inv = r.inv;
+}
+static void ed_show_chord(void)
+{
+    chord_t c = build_chord(ed.key);
+    chord_name(&c, chord_txt);
+}
+static void ed_load_char(void)
+{
+    int i;
+    ed.ch = 0;
+    for (i = 0; i < NCHARS; i++) if (CHARSET[i] == ed.p.name[ed.pos]) ed.ch = (uint8_t)i;
+}
+static void ed_store_fields(void)         /* the knobs -> the working copy (every key of that note when 'all octaves') */
+{
+    crec_t r;
+    uint16_t v;
+    int k;
+    r.root = ed.root; r.qual = ed.qual; r.third = ed.third; r.fifth = ed.fifth; r.ext = ed.ext; r.inv = ed.inv;
+    v = crec_pack(&r);
+    ed.p.rec[ed.key] = v;
+    if (ed.p.shared)
+        for (k = 0; k < NKEYS; k++) if ((k - ed.key) % 12 == 0) ed.p.rec[k] = v;
+    ed.dirty = 1;
+    ed_show_chord();
+    rechord();
+}
+static void ed_open(int key)              /* REC + key: the editor for that key (the first time: from the grid in use) */
+{
+    if (!ed.open) {
+        int g = set.grid, slot = g >= NGRID ? g - NGRID : set.cslot;
+        char nm[9];
+        if (slot >= NCUST) slot = 0;
+        ed.slot = (uint8_t)slot;
+        ed.p = set.cust[slot];
+        if (g < NGRID && !ed.p.used) cust_fill(&ed.p, g, set.key, set.rich);   /* a fresh preset starts as that grid */
+        set.grid = (uint8_t)(NGRID + slot);
+        set.cslot = (uint8_t)slot;
+        ed.open = 1; ed.sub = 0; ed.dirty = 0; ed.pos = 0;
+        ed_load_char();
+        set.page = PG_ED1;
+        cust_name(&ed.p, nm);
+        app_say("EDIT", nm);
+    }
+    ed.key = (uint8_t)key;
+    ed_load_fields();
+    ed_show_chord();
+}
+static void ed_close(void)                /* HOME or another page: what was not saved is dropped */
+{
+    if (!ed.open) return;
+    ed.open = 0;
+    app_say(ed.dirty ? "NOT SAVED" : "EDIT", ed.dirty ? "CHANGES DROPPED" : "CLOSED");
+    rechord();
+}
+static void ed_save(void)
+{
+    char nm[9];
+    set.cust[ed.slot] = ed.p;
+    set.cust[ed.slot].used = 1;
+    ed.p.used = 1;
+    ed.dirty = 0;
+    if (active) stop();                   /* the flash write stops the sound anyway: now, not 4 s later */
+    dirty();
+    dirty_at = plat_ms() - 4001u;
+    cust_name(&ed.p, nm);
+    app_say("SAVED", nm);
+}
+static void ed_slot_changed(void)         /* the SLOT knob: another preset (unsaved changes are dropped) */
+{
+    char nm[9];
+    ed.p = set.cust[ed.slot];
+    set.grid = (uint8_t)(NGRID + ed.slot);
+    set.cslot = ed.slot;
+    ed.dirty = 0;
+    ed_load_char();
+    ed_load_fields();
+    ed_show_chord();
+    rechord();
+    cust_name(&ed.p, nm);
+    app_say("PRESET", nm);
+}
+
 /* ------------------------------------------------------------------ pages --- */
-enum { PG_MAIN, PG_FX, PG_ACC, PG_GROOVE, PG_BASS, PG_DECOR, PG_DRUMS, NPAGE };
-static const char *const PAGE_NAME[NPAGE] = {"MAIN", "FX", "CHORDS", "GROOVE", "BASS", "DECOR", "DRUMS"};
-static const uint8_t PAGE_BTN[NPAGE] = {0xFF, B_FX, B_SEL, B_ENV, B_LFO, B_EDIT, B_GLO};
+static const char *const PAGE_NAME[NPAGE] = {"MAIN", "FX", "CHORDS", "GROOVE", "BASS", "DECOR", "DRUMS", "EDIT", "EDIT", "EDIT"};
+static const uint8_t PAGE_BTN[NPAGE] = {0xFF, B_FX, B_SEL, B_ENV, B_LFO, B_EDIT, B_GLO, 0xFF, 0xFF, 0xFF};
 static const uint8_t PAGE_RGB[NPAGE][3] = {{255, 150, 220}, {190, 150, 255}, {120, 230, 255}, {255, 214, 110},
-                                          {140, 240, 150}, {235, 235, 240}, {255, 140, 100}};
+                                          {140, 240, 150}, {235, 235, 240}, {255, 140, 100}, {255, 96, 96}, {255, 96, 96}, {255, 96, 96}};
 
 enum { KD_PCT, KD_OFF, KD_GLIDE, KD_BPM, KD_BIP, KD_LIST };
-enum { G_NONE, G_PARAMS, G_FX, G_GROOVE, G_DRUMS, G_BASS, G_CHORD, G_DRUMLVL };
+enum { G_NONE, G_PARAMS, G_FX, G_GROOVE, G_DRUMS, G_BASS, G_CHORD, G_DRUMLVL, G_ED, G_EDSCOPE, G_EDSLOT, G_EDPOS, G_EDCH };
 typedef struct {
     const char *lab;
     uint8_t *v;
@@ -434,15 +671,22 @@ static const kdef_t KD[NPAGE][4] = {
      {"EXTRA", &set.acc, 0, NACC - 1, KD_LIST, G_NONE, ACC_NAME}},
     {{"PATTERN", &set.dpat, 0, NDRUM - 1, KD_LIST, G_DRUMS, DRUM_NAME}, {"KICK", &set.dkick, 0, 100, KD_OFF, G_DRUMS, 0},
      {"HI-HAT", &set.dhat, 0, 100, KD_OFF, G_DRUMS, 0}, {"RIM", &set.drim, 0, 100, KD_OFF, G_DRUMS, 0}},
+    /* the chord editor (REC + key): sound of the chord, then its colour, then the preset and its name */
+    {{"ROOT", &ed.root, 0, 11, KD_LIST, G_ED, NOTE}, {"QUALITY", &ed.qual, 0, 5, KD_LIST, G_ED, QUAL_NAME},
+     {"3RD", &ed.third, 0, 1, KD_LIST, G_ED, ONOFF_NAME}, {"5TH", &ed.fifth, 0, 1, KD_LIST, G_ED, ONOFF_NAME}},
+    {{"EXTRA", &ed.ext, 0, 7, KD_LIST, G_ED, EXT_NAME}, {"INVERSION", &ed.inv, 0, 3, KD_LIST, G_ED, INV_NAME},
+     {"OCTAVES", &ed.p.shared, 0, 1, KD_LIST, G_EDSCOPE, SCOPE_NAME}, {"PRESET", &ed.slot, 0, NCUST - 1, KD_LIST, G_EDSLOT, SLOT_NAME}},
+    {{"POSITION", &ed.pos, 0, 7, KD_LIST, G_EDPOS, SLOT_NAME}, {"LETTER", &ed.ch, 0, NCHARS - 1, KD_LIST, G_EDCH, CHAR_NAME},
+     {"", &ed.pad, 0, 1, KD_LIST, G_NONE, ONOFF_NAME}, {"", &ed.pad, 0, 1, KD_LIST, G_NONE, ONOFF_NAME}},
 };
 
 static int settings_ok(void)
 {
     int p, k;
-    if (set.magic != SET_MAGIC || set.grid >= NGRID || set.octave < -2 || set.octave > 2 || set.sound >= NFAMILY * PER_FAMILY
+    if (set.magic != SET_MAGIC || set.grid >= NGRID + NCUST || set.cslot >= NCUST || set.octave < -2 || set.octave > 2 || set.sound >= NFAMILY * PER_FAMILY
         || set.rhythm >= NRHYTHM || set.page >= NPAGE)
         return 0;
-    for (p = 0; p < NPAGE; p++)
+    for (p = 0; p < PG_ED1; p++)
         for (k = 0; k < 4; k++)
             if (*KD[p][k].v < KD[p][k].lo || *KD[p][k].v > KD[p][k].hi) return 0;
     return 1;
@@ -458,6 +702,8 @@ void app_init(void)
     }
     if (plat_store_load(OBJ_SETTINGS, &set, sizeof set) != (int)sizeof set || !settings_ok())
         settings_defaults();
+    if (set.page >= PG_ED1) set.page = PG_MAIN;      /* the editor never opens by itself */
+    cust_sanitize();
     eng_init();
     send_sound();
     send_rhythm();
@@ -487,6 +733,8 @@ static struct {
     uint8_t bowl, dark, clean;           /* fun: the bowl view, the light off, no info on the screen */
     uint32_t sel_at;                     /* SEL pressed since (shift key) */
     uint8_t sel_used;                    /* another button was pressed while SEL was held */
+    uint32_t rec_at;                     /* REC pressed since */
+    uint8_t rec_used;                    /* REC was used with a key (or as a shift): not a tap */
 } ui;
 static uint32_t btn_now;                 /* the buttons as read this frame (SEL as shift is looked up here) */
 static void fun(int k);                  /* the bottom row (screen part) */
@@ -560,9 +808,21 @@ static float knob_text(const kdef_t *d, char *b)
 }
 
 static uint8_t prev_drums;
+static const char *grid_label(char *buf)         /* the name of the grid / custom preset in use (buf: 9 bytes) */
+{
+    if (set.grid < NGRID) return GRID_DEF[set.grid].name;
+    cust_name(cur_cust(), buf);
+    return buf;
+}
+
 static void apply_group(int g)
 {
     switch (g) {
+    case G_ED: ed_store_fields(); break;
+    case G_EDSCOPE: if (ed.p.shared) ed_store_fields(); else ed.dirty = 1; break;
+    case G_EDSLOT: ed_slot_changed(); break;
+    case G_EDPOS: ed_load_char(); break;
+    case G_EDCH: ed.p.name[ed.pos] = CHARSET[ed.ch]; ed.dirty = 1; break;
     case G_PARAMS: send_params(); break;
     case G_FX: send_fx(); break;
     case G_GROOVE: send_groove(); break;
@@ -580,6 +840,7 @@ static void apply_group(int g)
 static void knob(int k, int32_t e)
 {
     const kdef_t *d = &KD[set.page][k];
+    if (!d->lab[0]) return;              /* an empty slot of the name page */
     prev_drums = set.drums;
     int32_t step = d->kind == KD_LIST ? e : d->kind == KD_BPM ? accel(EN_K1 + k, e) : accel(EN_K1 + k, e) * 3;
     int32_t n = clamp((int32_t)*d->v + step, d->lo, d->hi);
@@ -593,7 +854,13 @@ static void encoder(int k, int32_t e)
 {
     switch (k) {
     case EN_SELECT:
-        wrap_u8(&set.grid, e, NGRID); set.rich = GRID_DEF[set.grid].rich; app_say("GRID", GRID_DEF[set.grid].name);
+        if (ed.open) { app_say("EDITING", "HOME TO LEAVE"); return; }
+        {
+            char nm[9];
+            wrap_u8(&set.grid, e, NGRID + NCUST);
+            if (set.grid < NGRID) set.rich = GRID_DEF[set.grid].rich;
+            app_say("GRID", grid_label(nm));
+        }
         rechord();
         break;
     case EN_ALGO:
@@ -621,6 +888,7 @@ static void button(int k)
     if (k == B_SEL) { ui.sel_at = plat_ms(); ui.sel_used = 0; return; }   /* acts on release (tap = CHORDS page) */
     for (p = 1; p < NPAGE; p++)
         if (PAGE_BTN[p] == k) {          /* a page; the same button again: back to the main page */
+            ed_close();
             set.page = (uint8_t)(set.page == p ? PG_MAIN : p);
             dirty();
             return;
@@ -628,14 +896,18 @@ static void button(int k)
     switch (k) {
     case B_HOME: ui.home_at = plat_ms(); ui.home_long = 0; return;    /* acts on release (held = help) */
     case B_SAVE:
-        if (!shift) { app_say("SAVE", "COMING SOON"); return; }
+        if (!shift) {
+            if (ed.open) ed_save();
+            else app_say("SAVE", "REC + KEY TO EDIT");
+            return;
+        }
         ui.bowl ^= 1u;                   /* SEL + SAVE: the bowl */
         eng_muffle(ui.bowl ? 1.0f : 0.0f);
         return;
     case B_REC:
-        if ((ui.btn >> B_HOME) & 1u) return;      /* HOME + REC: the reset (input), not food */
-        if (!shift) { app_say("REC", "COMING SOON"); return; }
-        fun(k);                          /* SEL + REC: food */
+        ui.rec_at = plat_ms();
+        ui.rec_used = (uint8_t)((((ui.btn >> B_HOME) & 1u) || shift) ? 1 : 0);   /* acts on release (a tap), or with a key */
+        if (shift && !((ui.btn >> B_HOME) & 1u)) fun(k);                         /* SEL + REC: food */
         return;
     case B_ARP: case B_SEQ:
         if (!shift) { app_say(k == B_ARP ? "ARP" : "SEQ", "COMING SOON"); return; }
@@ -667,6 +939,7 @@ static void input(void)
         uint32_t bit = 1u << k;
         if ((keys & bit) && !(ui.keys & bit)) {
             /* with a rhythm the chord keeps playing: the same key again stops it */
+            if (((btn >> B_REC) & 1u) && !((btn >> B_HOME) & 1u)) { ui.rec_used = 1; ed_open((int)k); dirty(); }   /* REC + key: edit */
             if (set.rhythm && active && held_idx < 0 && cur_idx == (int)k) stop();
             else { held_idx = (int)k; play((int)k); }
         } else if (!(keys & bit) && (ui.keys & bit) && held_idx == (int)k) {
@@ -680,20 +953,31 @@ static void input(void)
     }
     /* SEL released without any other button: a tap, the CHORDS page (the old SCL button) */
     if (!((btn >> B_SEL) & 1u) && ((ui.btn >> B_SEL) & 1u) && !ui.sel_used && now - ui.sel_at < 600u) {
+        ed_close();
         set.page = (uint8_t)(set.page == PG_ACC ? PG_MAIN : PG_ACC);
         dirty();
+    }
+    /* REC released alone: inside the editor the next of its three pages (chord, colour, name) */
+    if (!((btn >> B_REC) & 1u) && ((ui.btn >> B_REC) & 1u) && !ui.rec_used) {
+        if (ed.open) {
+            ed.sub = (uint8_t)((ed.sub + 1) % 3);
+            set.page = (uint8_t)(PG_ED1 + ed.sub);
+            if (ed.sub == 2) ed_load_char();
+        } else app_say("REC", "HOLD + PRESS A KEY");
     }
     /* HOME + REC held 3 s: back to the settings of the first start (a countdown; let go before: nothing) */
     if (((btn >> B_HOME) & 1u) && ((btn >> B_REC) & 1u)) {
         uint32_t held;
         char t[4];
         if (!ui.reset_at) { ui.reset_at = now | 1u; ui.reset_shown = 0; ui.reset_done = 0; }
+        ui.rec_used = 1;
         ui.home_long = 1; ui.help = 0;
         held = now - ui.reset_at;
         if (!ui.reset_done && held >= 3000u) {
             uint8_t page = PG_MAIN;
             ui.reset_done = 1;
             if (active) stop();
+            ed.open = 0;
             settings_defaults();
             set.page = page;
             ui.bowl = ui.dark = ui.clean = 0;
@@ -716,7 +1000,7 @@ static void input(void)
         if (ui.reset_at) ui.help = 0;
     } else if ((ui.btn >> B_HOME) & 1u) {
         if (ui.home_long) { ui.help = 0; ui.help_drawn = 0; }
-        else if (set.page != PG_MAIN) { set.page = PG_MAIN; dirty(); }
+        else if (set.page != PG_MAIN) { ed_close(); set.page = PG_MAIN; dirty(); }
     }
     for (k = 0; k < NE; k++)
         if ((e = plat_enc((int)k)) != 0)
@@ -730,7 +1014,11 @@ static void input(void)
     }
     /* lights: the keys glow, the one playing is lit; the page's button, the fun ones that are on, the pressed one */
     if (cur_idx >= 0) lit_keys |= 1u << (uint32_t)cur_idx;
-    if (set.page != PG_MAIN) lit_btn |= 1u << PAGE_BTN[set.page];
+    if (set.page != PG_MAIN && PAGE_BTN[set.page] != 0xFF) lit_btn |= 1u << PAGE_BTN[set.page];
+    if (ed.open) {                       /* the editor: REC lit, SAVE lit while there is something to save */
+        lit_btn |= 1u << B_REC;
+        if (ed.dirty) lit_btn |= 1u << B_SAVE;
+    }
     if (ui.bowl) lit_btn |= 1u << B_SAVE;
     if (ui.dark) lit_btn |= 1u << B_ARP;
     if (ui.clean) lit_btn |= LED_PLAY_GREEN;
@@ -1609,26 +1897,50 @@ static void draw_top_text(void)
         int k = (int)((now / 3000u) % 3u);
         cv_text(8, 0, &FONT_XS, CREDIT[k], k == 2 ? RGB(170, 166, 180) : RGB(255, 214, 110));
     } else {
+        char nm[9];
+        const char *gn = grid_label(nm);
         cv_text(8, 0, &FONT_XS, SOUND_NAME[set.sound], page_col());
-        cv_text(232 - text_w(&FONT_XS, GRID_DEF[set.grid].name), 0, &FONT_XS, GRID_DEF[set.grid].name, RGB(200, 196, 210));
+        cv_text(232 - text_w(&FONT_XS, gn), 0, &FONT_XS, gn, RGB(200, 196, 210));
     }
     cv_text(8, 9, &FONT_L, chord, active ? RGB(250, 248, 252) : RGB(170, 166, 180));
-    cv_text(232 - text_w(&FONT_S, NOTE[set.key]), 19, &FONT_S, NOTE[set.key], RGB(200, 196, 210));
+    if (set.grid < NGRID)                /* the key only means something for the built-in grids */
+        cv_text(232 - text_w(&FONT_S, NOTE[set.key]), 19, &FONT_S, NOTE[set.key], RGB(200, 196, 210));
 }
 
 static void draw_bottom_text(void)       /* in the second canvas: y 0 = screen row 120 */
 {
     int k;
-    int32_t y0 = 189 - 120, tw = text_w(&FONT_T, PAGE_NAME[set.page]) + 10;
+    int32_t y0 = 189 - 120, tw;
     uint16_t pc = page_col();
-    char t[32];
+    char t[32], tag[16];
+    const char *tn = PAGE_NAME[set.page];
+    if (set.page >= PG_ED1) {            /* EDIT <note of the key> <page letter> */
+        int kk = ed.key + 5;
+        char o[2], l[3];
+        o[0] = (char)('3' + kk / 12); o[1] = 0;
+        l[0] = ' '; l[1] = (char)('A' + (set.page - PG_ED1)); l[2] = 0;
+        tag[0] = 0;
+        text_cat(tag, "EDIT ");
+        text_cat(tag, NOTE[kk % 12]);
+        text_cat(tag, o);
+        text_cat(tag, l);
+        tn = tag;
+    }
+    tw = text_w(&FONT_T, tn) + 10;
     cv_rect(6, y0 + 1, tw, 13, pc);
-    cv_text(11, y0 + 1, &FONT_T, PAGE_NAME[set.page], RGB(0, 0, 0));
+    cv_text(11, y0 + 1, &FONT_T, tn, RGB(0, 0, 0));
     t[0] = 0;
-    text_cat(t, set.rhythm ? RHYTHM_NAME[set.rhythm] : "RHYTHM OFF");
-    if (set.drums) text_cat(t, " + DRUMS");
+    if (set.page >= PG_ED1) {            /* the preset being edited, a star when there is something to save */
+        char nm[9];
+        cust_name(&ed.p, nm);
+        text_cat(t, nm);
+        if (ed.dirty) text_cat(t, " *");
+    } else {
+        text_cat(t, set.rhythm ? RHYTHM_NAME[set.rhythm] : "RHYTHM OFF");
+        if (set.drums) text_cat(t, " + DRUMS");
+    }
     cv_text(232 - text_w(&FONT_T, t), y0 + 1, &FONT_T, t, RGB(170, 166, 180));
-    for (k = 0; k < 4; k++) {
+    for (k = 0; k < 4; k++) if (KD[set.page][k].lab[0]) {
         char v[24];
         const kdef_t *d = &KD[set.page][k];
         int32_t x = 6 + k * 58;
@@ -1704,6 +2016,28 @@ int app_expect(const char *what, int *got)
     else if (!strcmp(what, "syncbpm")) *got = (int)(ck_bpm + 0.5f);
     else if (!strcmp(what, "side")) *got = set.side;
     else if (!strcmp(what, "page")) *got = set.page;
+    else if (!strcmp(what, "edopen")) *got = ed.open;
+    else if (!strcmp(what, "edsub")) *got = ed.sub;
+    else if (!strcmp(what, "edkey")) *got = ed.key;
+    else if (!strcmp(what, "eddirty")) *got = ed.dirty;
+    else if (!strcmp(what, "edroot")) *got = ed.root;
+    else if (!strcmp(what, "edslot")) *got = ed.slot;
+    else if (!strcmp(what, "edshared")) *got = ed.p.shared;
+    else if (!strcmp(what, "cslot")) *got = set.cslot;
+    else if (!strcmp(what, "c0used")) *got = set.cust[0].used;
+    else if (!strcmp(what, "c0root")) *got = crec_unpack(set.cust[0].rec[KEY_C4]).root;
+    else if (!strcmp(what, "c0qual")) *got = crec_unpack(set.cust[0].rec[KEY_C4]).qual;
+    else if (!strcmp(what, "c0third")) *got = crec_unpack(set.cust[0].rec[KEY_C4]).third;
+    else if (!strcmp(what, "c0fifth")) *got = crec_unpack(set.cust[0].rec[KEY_C4]).fifth;
+    else if (!strcmp(what, "c0ext")) *got = crec_unpack(set.cust[0].rec[KEY_C4]).ext;
+    else if (!strcmp(what, "c0inv")) *got = crec_unpack(set.cust[0].rec[KEY_C4]).inv;
+    else if (!strcmp(what, "c0root19")) *got = crec_unpack(set.cust[0].rec[KEY_C4 + 12]).root;
+    else if (!strcmp(what, "c0qual19")) *got = crec_unpack(set.cust[0].rec[KEY_C4 + 12]).qual;
+    else if (!strcmp(what, "c1used")) *got = set.cust[1].used;
+    else if (!strcmp(what, "edname0")) *got = (unsigned char)ed.p.name[0];
+    else if (!strcmp(what, "c1name0")) *got = (unsigned char)set.cust[1].name[0];
+    else if (!strcmp(what, "note0")) *got = (int)vis[0].to;
+    else if (!strcmp(what, "bass")) *got = (int)vis[4].to;
     else if (!strcmp(what, "drums")) *got = set.drums;
     else if (!strcmp(what, "help")) *got = ui.help;
     else if (!strcmp(what, "bowl")) *got = ui.bowl;

@@ -8,7 +8,13 @@ Fork of **Blop by Obsimo** (OSR-Experiment/OSR-1, GPL-3.0-only) for the M-VAVE F
   INVERSION, OCTAVES (this key only / all octaves), PRESET (1-8). Page C: the preset name, letter by letter.
   Custom presets 1-8 are after the 38 grids on the SELECT encoder. A fresh preset starts as the grid that was playing.
   Changes not saved are dropped when you leave.
-- Work in progress: SEQ = chord sequencer, ARP = arpeggiator, PLAY/STOP = transport.
+- **Arpeggiator.** ARP opens its page (again: the second page, again: back to main). Page 1: MODE (off, up, down, up-down,
+  random, played = chord-tone order), RATE (1/4, 1/8, 1/16, 1/32), OCTAVES (1-4), GATE. Page 2: SWING, LATCH (the arpeggio
+  goes on after the key). It follows the clock (MIDI clock from the computer too) and goes out on MIDI. With a RHYTHM the
+  pattern is the mask: a rest is a rest, its velocities are the arpeggio's. STRUM does nothing while the arpeggio plays.
+- **PLAY / STOP** starts the last chord's rhythm or arpeggio again, or stops it.
+- Fixed: the same key in two octaves could play exactly the same notes (F#, Bb...).
+- Work in progress: SEQ = chord sequencer.
 
 The original README (French) follows.
 

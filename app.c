@@ -48,7 +48,9 @@ typedef struct {
     uint8_t creature, eyes, decor, acc;         /* decor */
     uint8_t cslot, rsv[2];                      /* the custom preset REC + key edits from a built-in grid */
     cust_t cust[NCUST];
+    uint8_t arp_mode, arp_rate, arp_oct, arp_gate, arp_swing, arp_latch;   /* the arpeggiator (added after the editor) */
 } settings_t;
+#define SET_SIZE_V2 552                  /* sizeof the settings before the arpeggiator: those saves still load */
 static settings_t set;
 static uint8_t set_dirty;
 static uint32_t dirty_at;             /* when the settings last changed (auto-save)*/
@@ -60,6 +62,7 @@ static struct {
     cust_t p;
 } ed;
 static void cust_defaults(void);
+static void arp_defaults(void) { set.arp_mode = 0; set.arp_rate = 2; set.arp_oct = 0; set.arp_gate = 60; set.arp_swing = 0; set.arp_latch = 0; }
 
 static void settings_defaults(void)
 {
@@ -73,6 +76,7 @@ static void settings_defaults(void)
     set.bsound = BASS_ROND; set.blevel = 80; set.bmotif = MOTIF_SUIT; set.bcut = 45;
     set.creature = 0; set.eyes = 0; set.decor = 0; set.acc = 0;
     cust_defaults();
+    arp_defaults();
 }
 
 static float glide_s(void) { return set.glide < 1u ? 0.0f : (float)set.glide * 0.015f; }
@@ -138,6 +142,9 @@ static const char *const QUAL_NAME[6] = {"MAJ", "MIN", "SUS2", "SUS4", "DIM", "A
 static const char *const EXT_NAME[8] = {"NONE", "7", "MAJ7", "6", "ADD9", "9", "MAJ9", "6/9"};
 static const char *const INV_NAME[4] = {"ROOT", "1ST", "2ND", "3RD"};
 static const char *const SCOPE_NAME[2] = {"THIS KEY", "ALL OCT"};
+static const char *const ARP_MODE_NAME[6] = {"OFF", "UP", "DOWN", "UP-DOWN", "RANDOM", "PLAYED"};
+static const char *const ARP_RATE_NAME[4] = {"1/4", "1/8", "1/16", "1/32"};
+static const char *const ARP_OCT_NAME[4] = {"1", "2", "3", "4"};
 static const char *const SLOT_NAME[NCUST] = {"1", "2", "3", "4", "5", "6", "7", "8"};
 static const char CHARSET[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
 #define NCHARS 38
@@ -322,6 +329,9 @@ static void chord_name(const chord_t *c, char *b)
 }
 
 /* the 4-note voicing closest to the centre: the same key always sounds the same */
+/* the lowest note a voicing may use: with 50 the chords of the low octave (F3..B3) could not go down enough and some
+ * (F#, Bb...) came out exactly like the same key one octave higher */
+#define VOICE_LO 45
 static void voice_chord(const chord_t *c, float *out)
 {
     int pcs[6], np = 0, i, r, base, best_set = 0, rlo, rhi;
@@ -347,7 +357,7 @@ static void voice_chord(const chord_t *c, float *out)
     if (c->inv_pc >= 0)                  /* an inversion: that note lowest (if the voicing kept it) */
         for (i = 0; i < np; i++) if (pcs[i] == c->inv_pc) { rlo = rhi = i; break; }
     for (r = rlo; r <= rhi; r++) {
-        for (base = 50 + c->shift; base <= 72 + c->shift; base++) {
+        for (base = VOICE_LO + c->shift; base <= 72 + c->shift; base++) {
             int notes[4], k, cur = base, cnt = 0;
             float mean = 0.0f, cost;
             for (k = 0; k < np; k++) {
@@ -356,7 +366,7 @@ static void voice_chord(const chord_t *c, float *out)
                 notes[cnt++] = cur++;
             }
             while (cnt < 4) { notes[cnt] = notes[cnt - np] + 12; cnt++; }     /* 1..3 notes: doubled an octave up */
-            if (notes[0] < 50 + c->shift || notes[cnt - 1] > 84 + c->shift) continue;
+            if (notes[0] < VOICE_LO + c->shift || notes[cnt - 1] > 84 + c->shift) continue;
             for (k = 0; k < 4; k++) mean += (float)notes[k];
             mean *= 0.25f;
             cost = fm_fabsf(mean - (float)center);
@@ -508,9 +518,14 @@ static void send_drums(void)
     }
 }
 static void send_bass(void) { eng_bass(set.bsound, set.bmotif, (float)set.blevel * 0.01f, (float)set.bcut * 0.01f); }
+static void send_arp(void)
+{
+    eng_arp(set.arp_mode, set.arp_rate, set.arp_oct + 1, (float)set.arp_gate * 0.01f, (float)set.arp_swing * 0.01f);
+}
 
 /* ------------------------------------------------------------------ playing --- */
 static int cur_idx = -1, held_idx = -1, active;
+static int last_idx = -1;                  /* the last chord played (PLAY starts it again after a STOP) */
 static char chord_txt[16] = "BLOPY";
 /* the voices' pitches for the screen, as the engine glides them */
 static struct { float from, to; uint32_t t0, dur; } vis[5];
@@ -539,8 +554,19 @@ static void play(int idx)
     }
     vis[4].from = vis_pitch(4, now); vis[4].to = bass; vis[4].t0 = now; vis[4].dur = (uint32_t)(g * 1000.0f);
     cur_idx = idx;
+    last_idx = idx;
     active = 1;
-    eng_chord(notes, bass, glide_s());
+    {   /* the same notes in the order of the chord tones (root first), for the arpeggiator's AS PLAYED */
+        float order[4];
+        int used[4] = {0, 0, 0, 0}, j, n = 0;
+        for (j = 0; j < c.n; j++) {
+            int pc = (c.root + c.iv[j]) % 12;
+            for (i = 0; i < 4; i++)
+                if (!used[i] && (int)(notes[i] + 0.5f) % 12 == pc) { order[n++] = notes[i]; used[i] = 1; break; }
+        }
+        for (i = 0; i < 4; i++) if (!used[i]) order[n++] = notes[i];
+        eng_chord(notes, order, bass, glide_s());
+    }
 }
 
 static void stop(void)
@@ -551,10 +577,11 @@ static void stop(void)
 }
 
 static void rechord(void) { if (active && cur_idx >= 0) play(cur_idx); }
+static int latch_on(void) { return set.rhythm || (set.arp_mode && set.arp_latch); }   /* the chord goes on after the key */
 
 /* ------------------------------------------------------------------ chord editor (REC + key) --- */
 static void dirty(void);
-enum { PG_MAIN, PG_FX, PG_ACC, PG_GROOVE, PG_BASS, PG_DECOR, PG_DRUMS, PG_ED1, PG_ED2, PG_ED3, NPAGE };
+enum { PG_MAIN, PG_FX, PG_ACC, PG_GROOVE, PG_BASS, PG_DECOR, PG_DRUMS, PG_ED1, PG_ED2, PG_ED3, PG_ARP1, PG_ARP2, NPAGE };
 
 static void ed_load_fields(void)
 {
@@ -643,13 +670,13 @@ static void ed_slot_changed(void)         /* the SLOT knob: another preset (unsa
 }
 
 /* ------------------------------------------------------------------ pages --- */
-static const char *const PAGE_NAME[NPAGE] = {"MAIN", "FX", "CHORDS", "GROOVE", "BASS", "DECOR", "DRUMS", "EDIT", "EDIT", "EDIT"};
-static const uint8_t PAGE_BTN[NPAGE] = {0xFF, B_FX, B_SEL, B_ENV, B_LFO, B_EDIT, B_GLO, 0xFF, 0xFF, 0xFF};
+static const char *const PAGE_NAME[NPAGE] = {"MAIN", "FX", "CHORDS", "GROOVE", "BASS", "DECOR", "DRUMS", "EDIT", "EDIT", "EDIT", "ARP", "ARP 2"};
+static const uint8_t PAGE_BTN[NPAGE] = {0xFF, B_FX, B_SEL, B_ENV, B_LFO, B_EDIT, B_GLO, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const uint8_t PAGE_RGB[NPAGE][3] = {{255, 150, 220}, {190, 150, 255}, {120, 230, 255}, {255, 214, 110},
-                                          {140, 240, 150}, {235, 235, 240}, {255, 140, 100}, {255, 96, 96}, {255, 96, 96}, {255, 96, 96}};
+                                          {140, 240, 150}, {235, 235, 240}, {255, 140, 100}, {255, 96, 96}, {255, 96, 96}, {255, 96, 96}, {110, 255, 200}, {110, 255, 200}};
 
 enum { KD_PCT, KD_OFF, KD_GLIDE, KD_BPM, KD_BIP, KD_LIST };
-enum { G_NONE, G_PARAMS, G_FX, G_GROOVE, G_DRUMS, G_BASS, G_CHORD, G_DRUMLVL, G_ED, G_EDSCOPE, G_EDSLOT, G_EDPOS, G_EDCH };
+enum { G_NONE, G_PARAMS, G_FX, G_GROOVE, G_DRUMS, G_BASS, G_CHORD, G_DRUMLVL, G_ED, G_EDSCOPE, G_EDSLOT, G_EDPOS, G_EDCH, G_ARP };
 typedef struct {
     const char *lab;
     uint8_t *v;
@@ -680,13 +707,19 @@ static const kdef_t KD[NPAGE][4] = {
      {"OCTAVES", &ed.p.shared, 0, 1, KD_LIST, G_EDSCOPE, SCOPE_NAME}, {"PRESET", &ed.slot, 0, NCUST - 1, KD_LIST, G_EDSLOT, SLOT_NAME}},
     {{"POSITION", &ed.pos, 0, 7, KD_LIST, G_EDPOS, SLOT_NAME}, {"LETTER", &ed.ch, 0, NCHARS - 1, KD_LIST, G_EDCH, CHAR_NAME},
      {"", &ed.pad, 0, 1, KD_LIST, G_NONE, ONOFF_NAME}, {"", &ed.pad, 0, 1, KD_LIST, G_NONE, ONOFF_NAME}},
+    /* the arpeggiator (ARP button; again for the second page, again for the main page) */
+    {{"MODE", &set.arp_mode, 0, 5, KD_LIST, G_ARP, ARP_MODE_NAME}, {"RATE", &set.arp_rate, 0, 3, KD_LIST, G_ARP, ARP_RATE_NAME},
+     {"OCTAVES", &set.arp_oct, 0, 3, KD_LIST, G_ARP, ARP_OCT_NAME}, {"GATE", &set.arp_gate, 10, 100, KD_PCT, G_ARP, 0}},
+    {{"SWING", &set.arp_swing, 0, 100, KD_OFF, G_ARP, 0}, {"LATCH", &set.arp_latch, 0, 1, KD_LIST, G_ARP, ONOFF_NAME},
+     {"", &ed.pad, 0, 1, KD_LIST, G_NONE, ONOFF_NAME}, {"", &ed.pad, 0, 1, KD_LIST, G_NONE, ONOFF_NAME}},
 };
 
 static int settings_ok(void)
 {
     int p, k;
     if (set.magic != SET_MAGIC || set.grid >= NGRID + NCUST || set.cslot >= NCUST || set.octave < -2 || set.octave > 2 || set.sound >= NFAMILY * PER_FAMILY
-        || set.rhythm >= NRHYTHM || set.page >= NPAGE)
+        || set.rhythm >= NRHYTHM || set.page >= NPAGE || set.arp_mode > 5 || set.arp_rate > 3 || set.arp_oct > 3
+        || set.arp_gate < 10 || set.arp_gate > 100 || set.arp_swing > 100 || set.arp_latch > 1)
         return 0;
     for (p = 0; p < PG_ED1; p++)
         for (k = 0; k < 4; k++)
@@ -702,8 +735,12 @@ void app_init(void)
         parse_chords(GRID_DEF[g].white, grid_w[g], 8);
         parse_chords(GRID_DEF[g].black, grid_b[g], 5);
     }
-    if (plat_store_load(OBJ_SETTINGS, &set, sizeof set) != (int)sizeof set || !settings_ok())
-        settings_defaults();
+    {
+        int n = plat_store_load(OBJ_SETTINGS, &set, sizeof set);
+        if (n == SET_SIZE_V2) arp_defaults();     /* saved before the arpeggiator existed: all the rest is kept */
+        else if (n != (int)sizeof set) n = -1;
+        if (n < 0 || !settings_ok()) settings_defaults();
+    }
     if (set.page >= PG_ED1) set.page = PG_MAIN;      /* the editor never opens by itself */
     cust_sanitize();
     eng_init();
@@ -714,6 +751,7 @@ void app_init(void)
     send_bass();
     send_fx();
     send_params();
+    send_arp();
 }
 
 void app_render(int32_t *lr, uint32_t n, uint32_t master_q12)
@@ -820,6 +858,7 @@ static const char *grid_label(char *buf)         /* the name of the grid / custo
 static void apply_group(int g)
 {
     switch (g) {
+    case G_ARP: send_arp(); if (!latch_on() && held_idx < 0 && active) stop(); break;
     case G_ED: ed_store_fields(); break;
     case G_EDSCOPE: if (ed.p.shared) ed_store_fields(); else ed.dirty = 1; break;
     case G_EDSLOT: ed_slot_changed(); break;
@@ -869,7 +908,7 @@ static void encoder(int k, int32_t e)
         wrap_u8(&set.rhythm, e, NRHYTHM);
         app_say("RHYTHM", set.rhythm ? RHYTHM_NAME[set.rhythm] : "OFF");
         send_rhythm();
-        if (!set.rhythm && held_idx < 0 && active) stop();   /* no rhythm, no latch */
+        if (!latch_on() && held_idx < 0 && active) stop();   /* no rhythm, no latch */
         break;
     case EN_PRESET:
         wrap_u8(&set.sound, e, NFAMILY * PER_FAMILY);
@@ -911,12 +950,23 @@ static void button(int k)
         ui.rec_used = (uint8_t)((((ui.btn >> B_HOME) & 1u) || shift) ? 1 : 0);   /* acts on release (a tap), or with a key */
         if (shift && !((ui.btn >> B_HOME) & 1u)) fun(k);                         /* SEL + REC: food */
         return;
-    case B_ARP: case B_SEQ:
-        if (!shift) { app_say(k == B_ARP ? "ARP" : "SEQ", "COMING SOON"); return; }
-        fun(k);                          /* SEL + ARP: the light, SEL + SEQ: a pirouette */
+    case B_ARP:
+        if (shift) { fun(k); return; }   /* SEL + ARP: the light */
+        ed_close();                      /* ARP: its page, again the second page, again the main page */
+        set.page = (uint8_t)(set.page == PG_ARP1 ? PG_ARP2 : set.page == PG_ARP2 ? PG_MAIN : PG_ARP1);
+        dirty();
+        return;
+    case B_SEQ:
+        if (!shift) { app_say("SEQ", "COMING SOON"); return; }
+        fun(k);                          /* SEL + SEQ: a pirouette */
         return;
     case B_PLAY:
-        if (!shift) { app_say("PLAY", "NO SEQ / ARP YET"); return; }
+        if (!shift) {                    /* PLAY / STOP: the last chord's rhythm or arpeggio */
+            if (active) { stop(); app_say("PLAY", "STOPPED"); }
+            else if (last_idx >= 0 && (set.rhythm || set.arp_mode)) { play(last_idx); app_say("PLAY", "STARTED"); }
+            else app_say("PLAY", "NEEDS RHYTHM OR ARP");
+            return;
+        }
         fun(k);                          /* SEL + PLAY: just the picture */
         return;
     case B_OCTDN:
@@ -942,11 +992,11 @@ static void input(void)
         if ((keys & bit) && !(ui.keys & bit)) {
             /* with a rhythm the chord keeps playing: the same key again stops it */
             if (((btn >> B_REC) & 1u) && !((btn >> B_HOME) & 1u)) { ui.rec_used = 1; ed_open((int)k); dirty(); }   /* REC + key: edit */
-            if (set.rhythm && active && held_idx < 0 && cur_idx == (int)k) stop();
+            if (latch_on() && active && held_idx < 0 && cur_idx == (int)k) stop();
             else { held_idx = (int)k; play((int)k); }
         } else if (!(keys & bit) && (ui.keys & bit) && held_idx == (int)k) {
             held_idx = -1;
-            if (!set.rhythm) stop();
+            if (!latch_on()) stop();
         }
     }
     for (k = 0; k < NB; k++) {
@@ -1017,6 +1067,7 @@ static void input(void)
     /* lights: the keys glow, the one playing is lit; the page's button, the fun ones that are on, the pressed one */
     if (cur_idx >= 0) lit_keys |= 1u << (uint32_t)cur_idx;
     if (set.page != PG_MAIN && PAGE_BTN[set.page] != 0xFF) lit_btn |= 1u << PAGE_BTN[set.page];
+    if (set.arp_mode || set.page == PG_ARP1 || set.page == PG_ARP2) lit_btn |= 1u << B_ARP;
     if (ed.open) {                       /* the editor: REC lit, SAVE lit while there is something to save */
         lit_btn |= 1u << B_REC;
         if (ed.dirty) lit_btn |= 1u << B_SAVE;
@@ -1916,7 +1967,7 @@ static void draw_bottom_text(void)       /* in the second canvas: y 0 = screen r
     uint16_t pc = page_col();
     char t[32], tag[16];
     const char *tn = PAGE_NAME[set.page];
-    if (set.page >= PG_ED1) {            /* EDIT <note of the key> <page letter> */
+    if (set.page >= PG_ED1 && set.page <= PG_ED3) {            /* EDIT <note of the key> <page letter> */
         int kk = ed.key + 5;
         char o[2], l[3];
         o[0] = (char)('3' + kk / 12); o[1] = 0;
@@ -1932,7 +1983,7 @@ static void draw_bottom_text(void)       /* in the second canvas: y 0 = screen r
     cv_rect(6, y0 + 1, tw, 13, pc);
     cv_text(11, y0 + 1, &FONT_T, tn, RGB(0, 0, 0));
     t[0] = 0;
-    if (set.page >= PG_ED1) {            /* the preset being edited, a star when there is something to save */
+    if (set.page >= PG_ED1 && set.page <= PG_ED3) {            /* the preset being edited, a star when there is something to save */
         char nm[9];
         cust_name(&ed.p, nm);
         text_cat(t, nm);
@@ -2036,6 +2087,38 @@ int app_expect(const char *what, int *got)
     else if (!strcmp(what, "c0root19")) *got = crec_unpack(set.cust[0].rec[KEY_C4 + 12]).root;
     else if (!strcmp(what, "c0qual19")) *got = crec_unpack(set.cust[0].rec[KEY_C4 + 12]).qual;
     else if (!strcmp(what, "c1used")) *got = set.cust[1].used;
+    else if (!strcmp(what, "octdup")) {   /* regression: the same key in two octaves must never give the same notes */
+        int g, tonic, vo, ka, kb, n = 0;
+        uint8_t sg = set.grid, sk = set.key, sv = set.voicing, sr = set.rich;
+        for (g = 0; g < NGRID; g++)
+            for (tonic = 0; tonic < 12; tonic++)
+                for (vo = 0; vo < 3; vo++) {
+                    set.grid = (uint8_t)g; set.key = (uint8_t)tonic; set.voicing = (uint8_t)vo; set.rich = GRID_DEF[g].rich;
+                    for (ka = 0; ka < NKEYS; ka++)
+                        for (kb = ka + 1; kb < NKEYS; kb++) {
+                            float na[4], nb[4];
+                            chord_t ca, cb;
+                            int i, same = 1;
+                            if (((ka - KEY_C4) % 12 + 12) % 12 != ((kb - KEY_C4) % 12 + 12) % 12) continue;
+                            ca = build_chord(ka); cb = build_chord(kb);
+                            voice_chord(&ca, na); spread(na, vo);
+                            voice_chord(&cb, nb); spread(nb, vo);
+                            for (i = 0; i < 4; i++) if (na[i] != nb[i]) same = 0;
+                            n += same;
+                        }
+                }
+        set.grid = sg; set.key = sk; set.voicing = sv; set.rich = sr;
+        *got = n;
+    }
+    else if (!strcmp(what, "saveold")) {  /* test: the settings as the version before the arpeggiator saved them, then wiped from RAM */
+        plat_store_save(OBJ_SETTINGS, &set, SET_SIZE_V2);
+        memset(&set, 0, sizeof set);
+        *got = 0;
+    }
+    else if (!strcmp(what, "arpmode")) *got = set.arp_mode;
+    else if (!strcmp(what, "arpticks")) *got = eng_arp_ticks();
+    else if (!strcmp(what, "arpoff")) *got = (int)__builtin_offsetof(settings_t, arp_mode);
+    else if (!strcmp(what, "setsize")) *got = (int)sizeof(settings_t);
     else if (!strcmp(what, "chordpower")) { const char *q = chord_txt; *got = 0; while (*q) { if (!strncmp(q, "POWER", 5)) *got = 1; q++; } }
     else if (!strcmp(what, "edname0")) *got = (unsigned char)ed.p.name[0];
     else if (!strcmp(what, "c1name0")) *got = (unsigned char)set.cust[1].name[0];

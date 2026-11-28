@@ -51,7 +51,12 @@ enum { MOTIF_SUIT, MOTIF_TENUE, MOTIF_CONTRE, MOTIF_OCTAVES, MOTIF_UN, MOTIF_GAL
 void eng_init(void);
 void eng_sound(const sound_t *p);
 void eng_rhythm(const rhythm_t *r);
-void eng_chord(const float notes[4], float bass, float glide_s);
+/* the chord: its 4 notes low to high, the same in the order of the chord tones (root first), the bass, the glide */
+void eng_chord(const float notes[4], const float order[4], float bass, float glide_s);
+/* the arpeggiator: mode 0 off, 1 up, 2 down, 3 up-down, 4 random, 5 as played (chord-tone order); rate 0..3 = 1/4 1/8
+ * 1/16 1/32; octs 1..4; gate 0..1; swing 0..1 */
+void eng_arp(int mode, int rate, int octs, float gate, float swing);
+int eng_arp_ticks(void);               /* notes the arpeggiator played (for the tests) */
 void eng_stop(void);
 /* an outside MIDI clock's beat: the even step STEP (0..15) began at AT_MS (plat_ms); STEP -1: the clock is gone */
 void eng_sync(int step, uint32_t at_ms);

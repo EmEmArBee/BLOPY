@@ -37,13 +37,14 @@ static float *const ap_buf[4] = {ap_buf0, ap_buf1, ap_buf2, ap_buf3};
 
 /* ------------------------------------------------------------------ command queue (main loop -> render) --- */
 enum { CMD_SOUND, CMD_RHYTHM, CMD_CHORD, CMD_STOP, CMD_PARAMS, CMD_FX, CMD_GROOVE, CMD_DRUMS, CMD_BASS, CMD_MUFFLE,
-       CMD_BLIP, CMD_PANIC, CMD_SYNC };
+       CMD_BLIP, CMD_PANIC, CMD_SYNC, CMD_ARP };
 typedef struct {
     uint8_t t;
     union {
         sound_t s;
         rhythm_t r;
-        struct { float notes[4], bass, glide; } c;
+        struct { float notes[4], order[4], bass, glide; } c;
+        struct { uint8_t mode, rate, octs; float gate, swing; } a;
         struct { float bpm, cut, q, side; uint8_t drums; } p;
         struct { float rev, del, trem, chorus; } f;
         float m;
@@ -128,6 +129,18 @@ static struct {
     volatile int last_kick;
     /* MIDI out (USB): the chord's and the bass's notes as they sound, channel 1 */
     uint8_t mv[4], mb, mvel;
+    /* arpeggiator: the chord's notes one after the other, on voice 0, on the step clock */
+    struct {
+        uint8_t mode, div, octs;        /* mode: 0 off; div: 1/4 1/8 1/16 1/32; octs 1..4 */
+        float gate, swing;
+        float ch[4], order[4];          /* the chord (low to high) and in the order of its chord tones */
+        float list[16];
+        int n, pos, dir;
+        uint32_t tick;
+        float pend, pvel, pgate;        /* a tick that waits (swing, the second 1/32) */
+    } ar;
+    float vmute[4];                     /* the voices heard: all, or only voice 0 (louder) with the arpeggiator */
+    volatile int arp_ticks;
     volatile int last_hit;
     volatile uint32_t last_hit_ms;
     float level;
@@ -165,11 +178,20 @@ static inline float osc(int w, float ph, float dt)
 /* ------------------------------------------------------------------ main-loop API --- */
 void eng_sound(const sound_t *p) { cmd_t c; c.t = CMD_SOUND; c.u.s = *p; push(&c); }
 void eng_rhythm(const rhythm_t *r) { cmd_t c; c.t = CMD_RHYTHM; c.u.r = *r; push(&c); }
-void eng_chord(const float notes[4], float bass, float glide_s)
+void eng_arp(int mode, int rate, int octs, float gate, float swing)
+{
+    cmd_t c;
+    c.t = CMD_ARP;
+    c.u.a.mode = (uint8_t)mode; c.u.a.rate = (uint8_t)rate; c.u.a.octs = (uint8_t)octs;
+    c.u.a.gate = gate; c.u.a.swing = swing;
+    push(&c);
+}
+void eng_chord(const float notes[4], const float order[4], float bass, float glide_s)
 {
     cmd_t c;
     c.t = CMD_CHORD;
     copy(c.u.c.notes, notes, sizeof c.u.c.notes);
+    copy(c.u.c.order, order, sizeof c.u.c.order);
     c.u.c.bass = bass;
     c.u.c.glide = glide_s;
     push(&c);
@@ -223,6 +245,7 @@ int eng_last_hit(uint32_t *at_ms)
     return E.last_hit;
 }
 float eng_level(void) { return E.level; }
+int eng_arp_ticks(void) { return E.arp_ticks; }
 
 static inline float rndu(void) { return 0.5f + 0.5f * rnd(); }
 static uint32_t now_ms(void) { return (uint32_t)((float)E.samples * (1000.0f / SR)); }
@@ -373,7 +396,7 @@ static void start_transport(void)
 }
 
 /* the transport runs while chords play a rhythm (with the drums), or the bass a motif */
-static int need_run(void) { return E.active && (!E.rh.hold || E.bmotif >= MOTIF_CONTRE); }   /* rhythm OFF: no drums */
+static int need_run(void) { return E.active && (E.ar.mode || !E.rh.hold || E.bmotif >= MOTIF_CONTRE); }   /* rhythm OFF: no drums */
 static void check_run(void)
 {
     if (need_run()) { if (!E.running) start_transport(); }
@@ -396,6 +419,93 @@ static void bass_hit(float gate_s, int oct)
     midi_bass_on();
 }
 
+/* ------------------------------------------------------------------ arpeggiator --- */
+enum { ARP_OFF, ARP_UP, ARP_DOWN, ARP_UPDN, ARP_RANDOM, ARP_PLAYED };
+
+static void arp_build(void)
+{
+    const float *src = E.ar.mode == ARP_PLAYED ? E.ar.order : E.ar.ch;
+    int i, k, n = 0, octs = E.ar.octs < 1 ? 1 : E.ar.octs > 4 ? 4 : E.ar.octs;
+    for (k = 0; k < octs; k++)
+        for (i = 0; i < 4; i++) {
+            float m = src[i] + 12.0f * (float)k;
+            if (n > 0 && E.ar.list[n - 1] == m) continue;      /* (the root doubled, then the next octave's root) */
+            E.ar.list[n++] = m;
+        }
+    E.ar.n = n;
+    if (E.ar.pos >= n) E.ar.pos = 0;
+}
+static void arp_reset(void)
+{
+    E.ar.pos = E.ar.mode == ARP_DOWN ? E.ar.n - 1 : 0;
+    E.ar.dir = 1;
+    E.ar.pend = 0.0f;
+}
+static int arp_next(void)               /* the note to play now (its index); the position moves on */
+{
+    int n = E.ar.n, p = E.ar.pos;
+    switch (E.ar.mode) {
+    case ARP_DOWN: E.ar.pos = (p + n - 1) % n; break;
+    case ARP_UPDN:
+        if (E.ar.dir > 0) { if (p + 1 >= n) { E.ar.dir = -1; E.ar.pos = p - 1; } else E.ar.pos = p + 1; }
+        else { if (p - 1 < 0) { E.ar.dir = 1; E.ar.pos = p + 1; } else E.ar.pos = p - 1; }
+        break;
+    case ARP_RANDOM:                    /* never the same note twice in a row */
+        E.ar.pos = (int)(rndu() * (float)n);
+        if (E.ar.pos >= n) E.ar.pos = n - 1;
+        if (E.ar.pos == p && n > 1) E.ar.pos = (p + 1 + (int)(rndu() * (float)(n - 1))) % n;
+        break;
+    default: E.ar.pos = (p + 1) % n; break;
+    }
+    if (E.ar.pos < 0) E.ar.pos = 0;
+    return p;
+}
+static void arp_fire(float vel, float gate_s)     /* one arpeggio note: voice 0, its own short envelope */
+{
+    const sound_t *p = &E.p;
+    float note = E.ar.list[arp_next()];
+    int i;
+    for (i = 0; i < 4; i++) { E.sdel[i] = 0.0f; E.sg[i] = 1.0f; }
+    E.v[0].m = E.v[0].target = note;
+    E.v[0].inc = 0.0f;
+    E.vel = vel;
+    E.stage = 1;
+    E.gate_left = gate_s;
+    E.atk_s = fm_maxf(1.0f, fm_minf(p->atk, 0.006f) * SR);
+    E.rel_s = fm_minf(p->rel, 0.25f) * SR;
+    E.fenv = 1.0f;
+    E.ienv = 1.0f;
+    if (E.bmotif == MOTIF_SUIT || E.bmotif == MOTIF_TENUE) E.bfenv = 1.0f;
+    E.mvel = (uint8_t)(30.0f + 97.0f * fm_minf(1.0f, vel));
+    if (p->engine == ENGINE_PLUCK) excite(&E.v[0], p->bright);
+    midi_voice_on(0);
+    if (E.bmotif == MOTIF_SUIT) midi_bass_on();
+    E.last_hit = vel > 0.8f ? 1 : 2;
+    E.last_hit_ms = now_ms();
+    E.arp_ticks++;
+}
+/* a tick of the arpeggio at step I (the 16th-note clock): 1/4 and 1/8 skip steps, 1/32 ticks twice a step; with a
+ * rhythm its pattern is the mask (a rest on a rest, the velocity of its hits) */
+static void arp_step(int i, float sl)
+{
+    static const float SPT[4] = {4.0f, 2.0f, 1.0f, 0.5f};
+    float spt = SPT[E.ar.div & 3], tl, vel = 0.85f, gate, delay;
+    int t;
+    if (spt >= 1.0f && (i % (int)spt)) return;
+    if (!E.rh.hold) {
+        vel = E.rh.v[i];
+        if (vel <= 0.0f) return;
+    }
+    tl = sl * spt;
+    gate = fm_minf(tl * 1.02f, tl * E.ar.gate);
+    for (t = 0; t < (spt < 1.0f ? 2 : 1); t++) {
+        int odd = (int)(E.ar.tick++ & 1u);
+        delay = (spt < 1.0f && t == 1 ? sl * 0.5f : 0.0f) + (odd ? tl * 0.33f * E.ar.swing : 0.0f);
+        if (delay < 1.0f) arp_fire(vel, gate);
+        else { E.ar.pend = delay; E.ar.pvel = vel; E.ar.pgate = gate; }
+    }
+}
+
 static void on_step(void)
 {
     int i = E.step, kick = 0;
@@ -414,7 +524,8 @@ static void on_step(void)
         }
         if (E.dr.r[i] > 0.0f) { E.r_env = 1.0f; E.r_gain = E.dr.r[i] * E.dr_l; E.r_ph1 = E.r_ph2 = 0.0f; }
     }
-    if (E.active && !E.rh.hold) {
+    if (E.active && E.ar.mode) arp_step(i, sl);
+    if (E.active && !E.rh.hold && !E.ar.mode) {
         float v = E.rh.v[i];
         int nlen = E.rh.len[i];
         if (v > 0.0f && E.dens < 0.0f && i != 0 && rndu() < -E.dens * 0.75f) v = 0.0f;      /* fewer hits */
@@ -444,9 +555,17 @@ static void on_step(void)
         E.running = 0;
 }
 
-static void chord_cmd(const float *notes, float bass, float glide)
+static void chord_cmd(const float *notes, const float *order, float bass, float glide)
 {
     float gc = glide * SR / (float)CHUNK;
+    copy(E.ar.ch, notes, sizeof E.ar.ch);
+    copy(E.ar.order, order, sizeof E.ar.order);
+    if (E.ar.mode) {                    /* the arpeggio plays the chord: no hit, the next tick has the new notes */
+        arp_build();
+        set_notes(notes, bass, 0.0f);
+        if (!E.active) { E.active = 1; arp_reset(); check_run(); }
+        return;
+    }
     if (!E.active) {
         E.active = 1;
         set_notes(notes, bass, 0.0f);
@@ -483,9 +602,34 @@ static void run_commands(void)
             }
             check_run();
             break;
-        case CMD_CHORD: chord_cmd(c->u.c.notes, c->u.c.bass, c->u.c.glide); break;
+        case CMD_CHORD: chord_cmd(c->u.c.notes, c->u.c.order, c->u.c.bass, c->u.c.glide); break;
+        case CMD_ARP: {
+            uint8_t was = E.ar.mode;
+            int k;
+            E.ar.mode = c->u.a.mode > ARP_PLAYED ? ARP_OFF : c->u.a.mode;
+            E.ar.div = c->u.a.rate & 3u; E.ar.octs = c->u.a.octs; E.ar.gate = c->u.a.gate; E.ar.swing = c->u.a.swing;
+            for (k = 0; k < 4; k++) E.vmute[k] = E.ar.mode ? (k == 0 ? 2.0f : 0.0f) : 1.0f;
+            arp_build();
+            if (E.ar.mode != was) {
+                E.ar.pend = 0.0f;
+                if (!was) {             /* on: the held chord gives way to the arpeggio */
+                    midi_chord_off();
+                    if (E.stage >= 1 && E.stage <= 3) E.gate_left = 0.0f;
+                    arp_reset();
+                } else if (!E.ar.mode) {    /* off: the chord is back */
+                    midi_chord_off();
+                    if (E.active) {
+                        set_notes(E.ar.ch, E.btarget, 0.0f);
+                        if (E.rh.hold) hit(1.0f, 1e9f, 0.0f);
+                    }
+                } else arp_reset();
+            }
+            check_run();
+            break;
+        }
         case CMD_STOP:
             E.active = 0;
+            E.ar.pend = 0.0f;
             if (E.stage >= 1 && E.stage <= 3) E.gate_left = 0.0f;
             if (E.bstage >= 1 && E.bstage <= 2) E.bgate = 0.0f;
             check_run();
@@ -566,7 +710,8 @@ void eng_init(void)
     E.dr.kit.k_drive = 1.6f; E.dr.kit.h_tone = 0.5f; E.dr.kit.h_closed = 0.016f; E.dr.kit.h_open = 0.09f;
     E.dr.kit.r_f1 = 1720.0f; E.dr.kit.r_f2 = 480.0f; E.dr.kit.r_dec = 0.008f; E.dr.kit.r_noise = 0.25f;
     E.bsound = BASS_ROND; E.blevel = 0.6f; E.bcut = 600.0f;
-    for (i = 0; i < 4; i++) E.sg[i] = 1.0f;
+    for (i = 0; i < 4; i++) { E.sg[i] = 1.0f; E.vmute[i] = 1.0f; }
+    E.ar.octs = 1; E.ar.gate = 0.6f; E.ar.div = 2; E.ar.dir = 1;
     E.dl_time = 0.75f * 60.0f / 118.0f * SR;
     E.p.engine = ENGINE_SUB; E.p.sus = 1.0f; E.p.atk = 0.01f; E.p.rel = 0.5f; E.p.dec = 0.3f; E.p.level = 1.0f;
     E.p.bass = 0.45f; E.p.mix2 = 0.5f; E.p.ratio = 1.0f; E.p.idx = 1.0f; E.p.idec = 0.4f; E.p.bright = 0.6f;
@@ -686,6 +831,10 @@ void eng_render(int32_t *lr, uint32_t n, float gain)
                     }
                     E.step_left -= 1.0f;
                 }
+                if (E.ar.pend > 0.0f) {         /* an arpeggio tick that waited (swing, the second 1/32) */
+                    E.ar.pend -= 1.0f;
+                    if (E.ar.pend <= 0.0f && E.active && E.ar.mode) arp_fire(E.ar.pvel, E.ar.pgate);
+                }
                 /* amp envelope */
                 switch (E.stage) {
                 case 1: E.e += E.vel / E.atk_s; if (E.e >= E.vel) { E.e = E.vel; E.stage = 2; } break;
@@ -765,7 +914,7 @@ void eng_render(int32_t *lr, uint32_t n, float gain)
                         if (E.sdel[i] <= 0.0f) E.sg[i] = fm_minf(1.0f, E.sg[i] + 0.004f);
                         vo *= E.sg[i];
                     }
-                    sum += vo;
+                    sum += vo * E.vmute[i];
                 }
                 sum += p->noise * rnd() * 4.0f;
                 /* filter: TPT state-variable lowpass */
